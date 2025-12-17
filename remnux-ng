@@ -19,6 +19,7 @@ set -euo pipefail
 SCRIPT_NAME="remnux-ng"
 SCRIPT_VERSION="1.0.0"
 CAST_VERSION="v1.0.0"
+# IMPORTANT: When updating CAST_VERSION, also update CAST_DEB_SHA256 below
 
 # Primary download URL (Debian package)
 CAST_DEB_URL="https://github.com/ekristen/cast/releases/download/${CAST_VERSION}/cast-${CAST_VERSION}-linux-amd64.deb"
@@ -200,7 +201,9 @@ version_compare() {
 
     local IFS=.
     local i
+    # shellcheck disable=SC2206
     local ver1=($v1)
+    # shellcheck disable=SC2206
     local ver2=($v2)
 
     # Fill empty positions with zeros
@@ -265,7 +268,7 @@ install_cast_from_deb() {
     local deb_file="$1"
 
     log_info "Installing Cast from Debian package..."
-    if ! dpkg -i "$deb_file" >/dev/null 2>&1; then
+    if ! dpkg -i "$deb_file" >/dev/null; then
         log_error "Failed to install Cast Debian package"
         return 1
     fi
@@ -279,21 +282,22 @@ ensure_cast_installed() {
         log_detail "Found Cast ${installed_version}"
         
         # Compare versions
-        if version_compare "$installed_version" "$CAST_VERSION"; then
-            case $? in
-                0)
-                    log_info "Cast ${CAST_VERSION} is already installed"
-                    return 0
-                    ;;
-                1)
-                    log_info "Installed Cast ${installed_version} is newer than expected ${CAST_VERSION}"
-                    return 0
-                    ;;
-                2)
-                    log_info "Upgrading Cast from ${installed_version} to ${CAST_VERSION}..."
-                    ;;
-            esac
-        fi
+        local cmp_result=0
+        version_compare "$installed_version" "$CAST_VERSION" || cmp_result=$?
+        
+        case $cmp_result in
+            0)
+                log_info "Cast ${CAST_VERSION} is already installed"
+                return 0
+                ;;
+            1)
+                log_info "Installed Cast ${installed_version} is newer than expected ${CAST_VERSION}"
+                return 0
+                ;;
+            2)
+                log_info "Upgrading Cast from ${installed_version} to ${CAST_VERSION}..."
+                ;;
+        esac
     else
         log_info "Cast not found, installing ${CAST_VERSION}..."
     fi
@@ -353,9 +357,9 @@ ensure_cast_installed() {
 get_legacy_mode() {
     if [[ -f "$LEGACY_CONFIG_FILE" ]]; then
         # Parse YAML-style config: mode: dedicated
-        # Handles "mode: dedicated" and "mode:dedicated"
+        # Handles "mode: dedicated" and "mode:dedicated", with optional leading whitespace
         local mode
-        mode=$(grep -E "^mode:" "$LEGACY_CONFIG_FILE" 2>/dev/null | sed -n 's/^mode:[[:space:]]*//p' || true)
+        mode=$(grep -E "^[[:space:]]*mode:" "$LEGACY_CONFIG_FILE" 2>/dev/null | sed -n 's/^[[:space:]]*mode:[[:space:]]*//p' || true)
         if [[ -n "$mode" ]]; then
             echo "$mode"
             return
@@ -367,7 +371,7 @@ get_legacy_mode() {
 get_legacy_user() {
     if [[ -f "$LEGACY_CONFIG_FILE" ]]; then
         local user
-        user=$(grep -E "^user:" "$LEGACY_CONFIG_FILE" 2>/dev/null | sed -n 's/^user:[[:space:]]*//p' || true)
+        user=$(grep -E "^[[:space:]]*user:" "$LEGACY_CONFIG_FILE" 2>/dev/null | sed -n 's/^[[:space:]]*user:[[:space:]]*//p' || true)
         if [[ -n "$user" ]]; then
             echo "$user"
             return
@@ -464,8 +468,8 @@ cmd_results() {
         # The file is YAML with structure like: local: { state_id: { result: true/false, ... } }
         local success_count
         local failure_count
-        success_count=$(grep -c "result: true" "$results_file" 2>/dev/null || echo "0")
-        failure_count=$(grep -c "result: false" "$results_file" 2>/dev/null || echo "0")
+        success_count=$(grep -c "result: true" "$results_file" 2>/dev/null) || success_count=0
+        failure_count=$(grep -c "result: false" "$results_file" 2>/dev/null) || failure_count=0
 
         echo "Summary:"
         echo "  Successful states: ${success_count}"
@@ -508,7 +512,15 @@ cmd_results() {
 cmd_debug() {
     echo "=== REMnux Debug Information ==="
     echo ""
-    echo "Script version: ${SCRIPT_VERSION}"
+    
+    if [[ $EUID -ne 0 ]]; then
+        log_warn "Running debug as non-root user."
+        log_warn "Some information (like Cast state in /root) may be inaccessible."
+        log_warn "For full debug info, run: sudo $0 debug"
+        echo ""
+    fi
+
+    echo "Script version: ${SCRIPT_NAME} ${SCRIPT_VERSION}"
     echo "Expected Cast version: ${CAST_VERSION}"
     echo ""
     
@@ -538,15 +550,56 @@ cmd_debug() {
         echo "Legacy config: not found"
     fi
     echo ""
+
+    # Check for Cast state file (YAML) in root's config directory since we run as sudo
+    local cast_state_file="/root/.config/cast/state.yaml"
     
-    echo "Cast state directory: /var/cache/cast"
-    if [[ -d /var/cache/cast ]]; then
+    if [[ -f "$cast_state_file" ]]; then
+        echo "Cast state file: ${cast_state_file}"
         echo "  exists: yes"
-        if [[ -f /var/cache/cast/state.json ]]; then
-            echo "  state.json: found"
-        fi
+        echo ""
+        echo "Cast state content:"
+        
+        # Simple parsing of the YAML structure
+        # Structure is usually:
+        # installations:
+        #   remnux:
+        #     distro_name: remnux
+        #     version: v2024.1
+        #     mode: dedicated
+        
+        local mode user version
+        # Extract values for 'remnux' entry
+        # We look for the block starting with "remnux:", then grab indented keys
+        # The awk command handles variable indentation (spaces/tabs)
+        # Logic: Find "remnux:", set flag. Once flag is set, find "mode:" or "version:" and print.
+        mode=$(awk '/^[[:space:]]*remnux:/ {found=1} found && /^[[:space:]]*mode:/ {print $2; exit}' "$cast_state_file" | tr -d '"') || mode=""
+        version=$(awk '/^[[:space:]]*remnux:/ {found=1} found && /^[[:space:]]*version:/ {print $2; exit}' "$cast_state_file" | tr -d '"') || version=""
+        
+        echo "  mode: ${mode:-not found}"
+        echo "  version: ${version:-not found}"
     else
-        echo "  exists: no"
+        echo "Cast state file: ${cast_state_file}"
+        echo "  exists: no (REMnux not yet installed via Cast or run as different user)"
+    fi
+
+    # Check for installed versions in remnux_salt-states
+    local version_dir="/var/cache/cast/remnux_salt-states"
+    if [[ -d "$version_dir" ]]; then
+        echo ""
+        echo "Installed versions (cached in /var/cache/cast):"
+        ls -1 "$version_dir" 2>/dev/null | grep -v '^\.' | sed 's/^/  /' || echo "  (none)"
+    fi
+
+    # Check last result time
+    local results_file="/var/cache/cast/installer/logs/results.yaml"
+    if [[ -f "$results_file" ]]; then
+        echo ""
+        echo "Last installation run:"
+        # Use stat for portable modification time (Linux syntax)
+        if command -v stat >/dev/null; then
+            stat -c "  Date: %y" "$results_file" 2>/dev/null || echo "  Date: unknown"
+        fi
     fi
 }
 
@@ -566,7 +619,11 @@ parse_args() {
                 shift
                 ;;
             --mode)
-                MODE="${2:-}"
+                if [[ -z "${2:-}" ]]; then
+                    log_error "--mode requires a value"
+                    exit 1
+                fi
+                MODE="$2"
                 shift 2
                 ;;
             --user=*)
@@ -574,7 +631,11 @@ parse_args() {
                 shift
                 ;;
             --user)
-                USER_SPECIFIED="${2:-}"
+                if [[ -z "${2:-}" ]]; then
+                    log_error "--user requires a value"
+                    exit 1
+                fi
+                USER_SPECIFIED="$2"
                 shift 2
                 ;;
             --version=*)
