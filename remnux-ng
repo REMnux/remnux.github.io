@@ -19,17 +19,18 @@ set -euo pipefail
 SCRIPT_NAME="remnux-ng"
 SCRIPT_VERSION="1.0.0"
 CAST_VERSION="v1.0.0"
-# IMPORTANT: When updating CAST_VERSION, also update CAST_DEB_SHA256 below
+# IMPORTANT: When updating CAST_VERSION, also update CAST_DEB_SHA256_* checksums below
 
-# Primary download URL (Debian package)
-CAST_DEB_URL="https://github.com/ekristen/cast/releases/download/${CAST_VERSION}/cast-${CAST_VERSION}-linux-amd64.deb"
+# Expected SHA256 checksums (from checksums.txt for v1.0.0)
+CAST_DEB_SHA256_AMD64="8d73856e4eef8a66d305861c6c81c763e5a3eea121a0f492ddf7caa11084a280"
+CAST_DEB_SHA256_ARM64="c3212e562ce3d5120b24b9fa3d2e3b3a8e1869a96d2351cd1b7344c037b8ba9f"
 
-# Fallback download URL (Debian package) - leave empty to disable fallback
-# Example: "https://remnux.org/files/cast-${CAST_VERSION}-linux-amd64.deb"
-CAST_DEB_FALLBACK_URL=""
+# GitHub base URL for Cast releases
+CAST_GITHUB_BASE_URL="https://github.com/ekristen/cast/releases/download"
 
-# Expected SHA256 checksum (from checksums.txt for v1.0.0)
-CAST_DEB_SHA256="8d73856e4eef8a66d305861c6c81c763e5a3eea121a0f492ddf7caa11084a280"
+# Fallback base URL (leave empty to disable fallback)
+# Example: "https://remnux.org/files"
+CAST_FALLBACK_BASE_URL=""
 
 # Installation path (where dpkg installs cast)
 CAST_BIN="/usr/bin/cast"
@@ -56,6 +57,59 @@ SKIP_CHECKSUM=false
 #############################################################################
 # Helper functions
 #############################################################################
+
+get_system_arch() {
+    # Detect system architecture and return the Cast package architecture name
+    local arch
+    arch=$(uname -m)
+    
+    case "$arch" in
+        x86_64|amd64)
+            echo "amd64"
+            ;;
+        aarch64|arm64)
+            echo "arm64"
+            ;;
+        *)
+            log_error "Unsupported architecture: ${arch}"
+            log_error "Supported architectures: x86_64 (amd64), aarch64 (arm64)"
+            exit 1
+            ;;
+    esac
+}
+
+get_cast_deb_url() {
+    # Construct the primary download URL for the Cast .deb package
+    local arch="$1"
+    echo "${CAST_GITHUB_BASE_URL}/${CAST_VERSION}/cast-${CAST_VERSION}-linux-${arch}.deb"
+}
+
+get_cast_deb_fallback_url() {
+    # Construct the fallback download URL for the Cast .deb package
+    local arch="$1"
+    if [[ -n "${CAST_FALLBACK_BASE_URL:-}" ]]; then
+        echo "${CAST_FALLBACK_BASE_URL}/cast-${CAST_VERSION}-linux-${arch}.deb"
+    else
+        echo ""
+    fi
+}
+
+get_cast_deb_sha256() {
+    # Return the expected SHA256 checksum for the given architecture
+    local arch="$1"
+    case "$arch" in
+        amd64)
+            echo "$CAST_DEB_SHA256_AMD64"
+            ;;
+        arm64)
+            echo "$CAST_DEB_SHA256_ARM64"
+            ;;
+        *)
+            log_error "No checksum available for architecture: ${arch}"
+            exit 1
+            ;;
+    esac
+}
 
 log_info() {
     echo "> $*"
@@ -302,6 +356,17 @@ ensure_cast_installed() {
         log_info "Cast not found, installing ${CAST_VERSION}..."
     fi
 
+    # Detect system architecture
+    local arch
+    arch=$(get_system_arch)
+    log_detail "Detected architecture: ${arch}"
+
+    # Get architecture-specific URL and checksum
+    local cast_deb_url
+    local cast_deb_sha256
+    cast_deb_url=$(get_cast_deb_url "$arch")
+    cast_deb_sha256=$(get_cast_deb_sha256 "$arch")
+
     # Create temp directory for downloads
     local tmp_dir
     tmp_dir=$(mktemp -d)
@@ -313,10 +378,10 @@ ensure_cast_installed() {
 
     # Try primary URL (Debian package)
     local deb_file="${tmp_dir}/cast.deb"
-    log_info "Downloading Cast ${CAST_VERSION}..."
+    log_info "Downloading Cast ${CAST_VERSION} for ${arch}..."
     
-    if download_file "$CAST_DEB_URL" "$deb_file"; then
-        if verify_checksum "$deb_file" "$CAST_DEB_SHA256"; then
+    if download_file "$cast_deb_url" "$deb_file"; then
+        if verify_checksum "$deb_file" "$cast_deb_sha256"; then
             if install_cast_from_deb "$deb_file"; then
                 cleanup_tmp
                 log_info "Cast ${CAST_VERSION} installed successfully"
@@ -328,11 +393,14 @@ ensure_cast_installed() {
     log_warn "Primary download failed, trying fallback..."
 
     # Try fallback URL (Debian package) if configured
-    if [[ -n "${CAST_DEB_FALLBACK_URL:-}" ]]; then
+    local cast_deb_fallback_url
+    cast_deb_fallback_url=$(get_cast_deb_fallback_url "$arch")
+    
+    if [[ -n "$cast_deb_fallback_url" ]]; then
         local fallback_deb="${tmp_dir}/cast-fallback.deb"
         
-        if download_file "$CAST_DEB_FALLBACK_URL" "$fallback_deb"; then
-            if verify_checksum "$fallback_deb" "$CAST_DEB_SHA256"; then
+        if download_file "$cast_deb_fallback_url" "$fallback_deb"; then
+            if verify_checksum "$fallback_deb" "$cast_deb_sha256"; then
                 if install_cast_from_deb "$fallback_deb"; then
                     cleanup_tmp
                     log_info "Cast ${CAST_VERSION} installed successfully (from fallback)"
@@ -522,6 +590,15 @@ cmd_debug() {
 
     echo "Script version: ${SCRIPT_NAME} ${SCRIPT_VERSION}"
     echo "Expected Cast version: ${CAST_VERSION}"
+    echo ""
+    
+    # Show architecture info
+    local arch
+    arch=$(get_system_arch 2>/dev/null || echo "unknown")
+    echo "System architecture: $(uname -m) (${arch})"
+    if [[ "$arch" != "unknown" ]]; then
+        echo "Cast download URL: $(get_cast_deb_url "$arch")"
+    fi
     echo ""
     
     local cast_path
